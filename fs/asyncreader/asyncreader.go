@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/ncw/rclone/lib/mmap"
 	"github.com/ncw/rclone/lib/readers"
 	"github.com/pkg/errors"
 )
@@ -15,10 +16,6 @@ const (
 	BufferSize       = 1024 * 1024
 	softStartInitial = 4 * 1024
 )
-
-var asyncBufferPool = sync.Pool{
-	New: func() interface{} { return newBuffer() },
-}
 
 var errorStreamAbandoned = errors.New("stream abandoned")
 
@@ -101,13 +98,14 @@ func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
 // return the buffer to the pool (clearing it)
 func (a *AsyncReader) putBuffer(b *buffer) {
 	b.clear()
-	asyncBufferPool.Put(b)
+	mmap.Free(b.mem)
+	b.mem = nil
+	b.buf = nil
 }
 
 // get a buffer from the pool
 func (a *AsyncReader) getBuffer() *buffer {
-	b := asyncBufferPool.Get().(*buffer)
-	return b
+	return newBuffer()
 }
 
 // Read will return the next available data.
@@ -220,14 +218,17 @@ func (a *AsyncReader) Close() (err error) {
 // If an error is present, it must be returned
 // once all buffer content has been served.
 type buffer struct {
+	mem    []byte
 	buf    []byte
 	err    error
 	offset int
 }
 
 func newBuffer() *buffer {
+	mem := mmap.Alloc(BufferSize)
 	return &buffer{
-		buf: make([]byte, BufferSize),
+		mem: mem,
+		buf: mem,
 		err: nil,
 	}
 }
