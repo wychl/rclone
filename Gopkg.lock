@@ -44,12 +44,6 @@
   revision = "ef1e4c783f8f0478bd8bff0edb3dd0bade552599"
 
 [[projects]]
-  name = "github.com/VividCortex/ewma"
-  packages = ["."]
-  revision = "b24eb346a94c3ba12c1da1e564dbac1b498a77ce"
-  version = "v1.1.1"
-
-[[projects]]
   branch = "master"
   name = "github.com/a8m/tree"
   packages = ["."]
@@ -482,6 +476,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "e250c0e18b90fecd81621d7ffcc1580931e668bac9048de910fdf6df8e4a140c"
+  inputs-digest = "cf0cc61fd4d78a322e09774d47c335bc17a2babc9bdee8d768d93410534cb487"
   solver-name = "gps-cdcl"
   solver-version = 1
