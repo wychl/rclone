@@ -96,7 +96,14 @@ func (o *Object) commitUpload(SessionID string, parts []api.Part, modTime time.T
 	request.Attributes.ContentCreatedAt = api.Time(modTime)
 	var body []byte
 	var resp *http.Response
+	// Empirically in https://github.com/ncw/rclone/issues/2054 it
+	// was discovered that 20 tries is enough, so make this the
+	// minimum value with larger values settable with
+	// --low-level-retries
 	maxTries := fs.Config.LowLevelRetries
+	if maxTries < 20 {
+		maxTries = 20
+	}
 	const defaultDelay = 10
 	var tries int
 outer:
