@@ -43,9 +43,9 @@ type syncCopyMove struct {
 	srcEmptyDirsMu sync.Mutex             // protect srcEmptyDirs
 	srcEmptyDirs   map[string]fs.DirEntry // potentially empty directories
 	checkerWg      sync.WaitGroup         // wait for checkers
-	toBeChecked    fs.ObjectPairChan      // checkers channel
+	toBeChecked    *pipe                  // checkers channel
 	transfersWg    sync.WaitGroup         // wait for transfers
-	toBeUploaded   fs.ObjectPairChan      // copiers channel
+	toBeUploaded   *pipe                  // copiers channel
 	errorMu        sync.Mutex             // Mutex covering the errors variables
 	err            error                  // normal error from copy process
 	noRetryErr     error                  // error with NoRetry set
@@ -54,7 +54,7 @@ type syncCopyMove struct {
 	renameMapMu    sync.Mutex             // mutex to protect the below
 	renameMap      map[string][]fs.Object // dst files by hash - only used by trackRenames
 	renamerWg      sync.WaitGroup         // wait for renamers
-	toBeRenamed    fs.ObjectPairChan      // renamers channel
+	toBeRenamed    *pipe                  // renamers channel
 	trackRenamesWg sync.WaitGroup         // wg for background track renames
 	trackRenamesCh chan fs.Object         // objects are pumped in here
 	renameCheck    []fs.Object            // accumulate files to check for rename here
@@ -75,12 +75,12 @@ func newSyncCopyMove(fdst, fsrc fs.Fs, deleteMode fs.DeleteMode, DoMove bool, de
 		dstFilesResult:     make(chan error, 1),
 		dstEmptyDirs:       make(map[string]fs.DirEntry),
 		srcEmptyDirs:       make(map[string]fs.DirEntry),
-		toBeChecked:        make(fs.ObjectPairChan, fs.Config.Transfers),
-		toBeUploaded:       make(fs.ObjectPairChan, fs.Config.Transfers),
+		toBeChecked:        newPipe(accounting.Stats.SetCheckQueue),
+		toBeUploaded:       newPipe(accounting.Stats.SetTransferQueue),
 		deleteFilesCh:      make(chan fs.Object, fs.Config.Checkers),
 		trackRenames:       fs.Config.TrackRenames,
 		commonHash:         fsrc.Hashes().Overlap(fdst.Hashes()).GetOne(),
-		toBeRenamed:        make(fs.ObjectPairChan, fs.Config.Transfers),
+		toBeRenamed:        newPipe(accounting.Stats.SetRenameQueue),
 		trackRenamesCh:     make(chan fs.Object, fs.Config.Checkers),
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
@@ -197,17 +197,18 @@ func (s *syncCopyMove) currentError() error {
 // pairChecker reads Objects~s on in send to out if they need transferring.
 //
 // FIXME potentially doing lots of hashes at once
-func (s *syncCopyMove) pairChecker(in fs.ObjectPairChan, out fs.ObjectPairChan, wg *sync.WaitGroup) {
+func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		if s.aborting() {
 			return
 		}
 		select {
-		case pair, ok := <-in:
+		case _, ok := <-in.C:
 			if !ok {
 				return
 			}
+			pair := in.Get()
 			src := pair.Src
 			accounting.Stats.Checking(src.Remote())
 			// Check to see if can store this
@@ -228,18 +229,10 @@ func (s *syncCopyMove) pairChecker(in fs.ObjectPairChan, out fs.ObjectPairChan, 
 							} else {
 								// If successful zero out the dst as it is no longer there and copy the file
 								pair.Dst = nil
-								select {
-								case <-s.ctx.Done():
-									return
-								case out <- pair:
-								}
+								out.Put(pair)
 							}
 						} else {
-							select {
-							case <-s.ctx.Done():
-								return
-							case out <- pair:
-							}
+							out.Put(pair)
 						}
 					}
 				} else {
@@ -259,25 +252,22 @@ func (s *syncCopyMove) pairChecker(in fs.ObjectPairChan, out fs.ObjectPairChan, 
 
 // pairRenamer reads Objects~s on in and attempts to rename them,
 // otherwise it sends them out if they need transferring.
-func (s *syncCopyMove) pairRenamer(in fs.ObjectPairChan, out fs.ObjectPairChan, wg *sync.WaitGroup) {
+func (s *syncCopyMove) pairRenamer(in *pipe, out *pipe, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		if s.aborting() {
 			return
 		}
 		select {
-		case pair, ok := <-in:
+		case _, ok := <-in.C:
 			if !ok {
 				return
 			}
+			pair := in.Get()
 			src := pair.Src
 			if !s.tryRename(src) {
 				// pass on if not renamed
-				select {
-				case <-s.ctx.Done():
-					return
-				case out <- pair:
-				}
+				out.Put(pair)
 			}
 		case <-s.ctx.Done():
 			return
@@ -286,7 +276,7 @@ func (s *syncCopyMove) pairRenamer(in fs.ObjectPairChan, out fs.ObjectPairChan, 
 }
 
 // pairCopyOrMove reads Objects on in and moves or copies them.
-func (s *syncCopyMove) pairCopyOrMove(in fs.ObjectPairChan, fdst fs.Fs, wg *sync.WaitGroup) {
+func (s *syncCopyMove) pairCopyOrMove(in *pipe, fdst fs.Fs, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var err error
 	for {
@@ -294,10 +284,11 @@ func (s *syncCopyMove) pairCopyOrMove(in fs.ObjectPairChan, fdst fs.Fs, wg *sync
 			return
 		}
 		select {
-		case pair, ok := <-in:
+		case _, ok := <-in.C:
 			if !ok {
 				return
 			}
+			pair := in.Get()
 			src := pair.Src
 			accounting.Stats.Transferring(src.Remote())
 			if s.DoMove {
@@ -323,7 +314,7 @@ func (s *syncCopyMove) startCheckers() {
 
 // This stops the background checkers
 func (s *syncCopyMove) stopCheckers() {
-	close(s.toBeChecked)
+	s.toBeChecked.Close()
 	fs.Infof(s.fdst, "Waiting for checks to finish")
 	s.checkerWg.Wait()
 }
@@ -338,7 +329,7 @@ func (s *syncCopyMove) startTransfers() {
 
 // This stops the background transfers
 func (s *syncCopyMove) stopTransfers() {
-	close(s.toBeUploaded)
+	s.toBeUploaded.Close()
 	fs.Infof(s.fdst, "Waiting for transfers to finish")
 	s.transfersWg.Wait()
 }
@@ -359,7 +350,7 @@ func (s *syncCopyMove) stopRenamers() {
 	if !s.trackRenames {
 		return
 	}
-	close(s.toBeRenamed)
+	s.toBeRenamed.Close()
 	fs.Infof(s.fdst, "Waiting for renames to finish")
 	s.renamerWg.Wait()
 }
@@ -685,11 +676,7 @@ func (s *syncCopyMove) run() error {
 		s.makeRenameMap()
 		// Attempt renames for all the files which don't have a matching dst
 		for _, src := range s.renameCheck {
-			select {
-			case <-s.ctx.Done():
-				break
-			case s.toBeRenamed <- fs.ObjectPair{Src: src, Dst: nil}:
-			}
+			s.toBeRenamed.Put(fs.ObjectPair{Src: src, Dst: nil})
 		}
 	}
 
@@ -792,11 +779,7 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 			}
 		} else {
 			// No need to check since doesn't exist
-			select {
-			case <-s.ctx.Done():
-				return
-			case s.toBeUploaded <- fs.ObjectPair{Src: x, Dst: nil}:
-			}
+			s.toBeUploaded.Put(fs.ObjectPair{Src: x, Dst: nil})
 		}
 	case fs.Directory:
 		// Do the same thing to the entire contents of the directory
@@ -825,11 +808,7 @@ func (s *syncCopyMove) Match(dst, src fs.DirEntry) (recurse bool) {
 		}
 		dstX, ok := dst.(fs.Object)
 		if ok {
-			select {
-			case <-s.ctx.Done():
-				return
-			case s.toBeChecked <- fs.ObjectPair{Src: srcX, Dst: dstX}:
-			}
+			s.toBeChecked.Put(fs.ObjectPair{Src: srcX, Dst: dstX})
 		} else {
 			// FIXME src is file, dst is directory
 			err := errors.New("can't overwrite directory with file")
