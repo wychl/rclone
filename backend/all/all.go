@@ -3,6 +3,7 @@ package all
 import (
 	// Active file systems
 	_ "github.com/ncw/rclone/backend/alias"
+	_ "github.com/ncw/rclone/backend/aliyun"
 	_ "github.com/ncw/rclone/backend/amazonclouddrive"
 	_ "github.com/ncw/rclone/backend/azureblob"
 	_ "github.com/ncw/rclone/backend/b2"
